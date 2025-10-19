@@ -231,8 +231,13 @@ def _run_simulations_weighted(...):
 
 ## Часть 2: Анализ результатов
 
+### Корреляционная матрица
 ![Correlation Analysis](correlation.png)
+
+### Анализ Success rate в зависимости от размера группы
 ![Threshold Analysis](threshold_analysis.png)
+
+### Детальный сегментированный анализ по достижению допустимого уровня success rate (>= 80%)
 ![Detailed Analysis](detailed_segment_analysis.png)
 
 
