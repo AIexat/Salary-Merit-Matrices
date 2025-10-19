@@ -150,6 +150,8 @@ merit_matrix_project/
 
 ## Часть 2: Анализ результатов
 
+![Threshold Analysis](threshold_analysis.png)
+
 ### Ключевая находка: критическая зависимость от размера группы
 
 **Success rate по размеру группы:**
