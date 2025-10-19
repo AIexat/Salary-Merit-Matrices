@@ -98,15 +98,13 @@ HR использует формулу:
 ```
 merit_matrix_project/
 ├── data/
-│   └── Moscow.parquet.gzip                    # Подготовленные данные
+│   └── Moscow.parquet.gzip                    # Подготовленные данные (конфиденциальны)
 ├── notebooks/
 │   ├── 01_Monte_Carlo_Simulation.ipynb        # Часть 1: Симуляции
 │   ├── 02_Results_Analysis.ipynb              # Часть 2: Анализ
 │   └── 03_Genetic_Algorithm_Optimizer.ipynb   # Часть 3: Оптимизация
-├── results/
-│   └── merit_analysis_results/                # Результаты симуляций
 ├── visualizations/
-│   └── success_rate_by_parameters.png         # Графики
+│   └── threshold_analysis.png                 # Графики
 └── README.md                                  # Данный документ
 ```
 
