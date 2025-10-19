@@ -227,7 +227,9 @@ def _run_simulations_weighted(...):
 
 ## Часть 2: Анализ результатов
 
+![Correlation Analysis](correlation.png)
 ![Threshold Analysis](threshold_analysis.png)
+
 
 ### Ключевая находка: критическая зависимость от размера группы
 
