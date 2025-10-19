@@ -229,6 +229,8 @@ def _run_simulations_weighted(...):
 
 ![Correlation Analysis](correlation.png)
 ![Threshold Analysis](threshold_analysis.png)
+![Detailed Analysis](detailed_segment_analysis.png)
+
 
 
 # Success Rate Analysis: Комплексный анализ порогов надежности
