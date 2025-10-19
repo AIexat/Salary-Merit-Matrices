@@ -618,6 +618,398 @@ Metrics:
 └─ Mean Deviation: 1.23% от целевого бюджета
 ```
 
+## Технические решения
+
+## Используемые библиотеки
+
+**Обработка данных:**
+* `pandas` — загрузка employee data, группировка по CR bins
+* `numpy` — векторизованные операции с матрицами, массивами зарплат
+
+**Статистическое моделирование:**
+* `scipy.stats.dirichlet` — моделирование вариаций распределения рейтингов
+  * Параметр `concentration` (~167 по умолчанию) контролирует разброс вокруг целевого распределения
+  * Имитирует реальность: менеджеры следуют политике HR, но с отклонениями ±2-3%
+  * Метод `dirichlet.rvs()` генерирует случайные распределения, близкие к целевому
+* `scipy.stats.norm` — генерация автоматических bell-curve распределений рейтингов
+* `scipy.optimize.minimize` — локальная оптимизация топ-5 кандидатов
+  * Метод: L-BFGS-B (bounded optimization)
+  * Constraints: cell bounds, anchor cells, strict zeros
+
+**Обработка изображений (для матриц):**
+* `scipy.ndimage.gaussian_filter` — сглаживание матриц после кроссовера
+  * Параметр `sigma=0.5` для мягкого устранения шума
+  * Режим `mode='nearest'` для корректной обработки краёв
+
+**Структуры данных:**
+* `dataclasses` — типизированные структуры для кандидатов и policy guidance
+
+## Ключевые технические решения
+
+### 1. Adaptive Constraint Generation
+
+**Merit-pool-aware constraints**
+```python
+def auto_configure_constraints():
+    # Base step как % от merit pool, не от theoretical span
+    base_step_factor = 0.15  # 15% от merit pool
+    min_step_rating = merit_pool_pct * base_step_factor
+    
+    # Адаптивные multipliers для cell_max
+    if merit_pool_pct <= 0.03:
+        multiplier = 4.0  # Tight pools need higher ceiling
+    elif merit_pool_pct <= 0.12:
+        multiplier = 2.5
+    else:
+        multiplier = 1.5
+```
+
+**Обоснование:** Merit pool 8% → realistic steps ~0.8-1.2% → feasible total range ~4-5% (вместо 24%).
+
+**Validation logic:**
+```python
+# Real-time feasibility check
+min_range_rating = min_step_rating * (num_ratings - 1)
+available_span = cell_max - cell_min
+
+if min_range_rating > available_span * 0.9:
+    print("⚠ WARNING: Rating step requirements are very tight!")
+```
+
+### 2. Dirichlet Sampling с Hard Zero Support
+
+**Challenge:** Как моделировать вариации рейтингов, если целевое распределение содержит нули?
+
+**Решение: Adaptive Dirichlet**
+```python
+def compute_dirichlet_alphas(base_probs, concentration):
+    # Detect distribution peakiness via entropy
+    entropy = -np.sum(base_probs * np.log(base_probs + eps))
+    max_entropy = np.log(len(base_probs))
+    peakiness_factor = (max_entropy - entropy) / max_entropy
+    
+    # Scale concentration for peaked distributions (reduce variance)
+    scale = 1.0 + 1.0 * peakiness_factor
+    alphas = base_probs / base_probs.sum() * concentration * scale
+```
+
+**Hard zero enforcement:**
+```python
+if HARD_ZERO_RATINGS and np.any(base_probs == 0):
+    # Sample only from non-zero ratings
+    nz_idx = np.flatnonzero(base_probs > 0)
+    sub_alphas = compute_dirichlet_alphas(base_probs[nz_idx], concentration)
+    sub_draw = rng.dirichlet(sub_alphas)
+    
+    # Reconstruct with zeros
+    draw = np.zeros_like(base_probs)
+    draw[nz_idx] = sub_draw
+```
+
+**Эффект:** Рейтинги с 0% target полностью исключены из Monte Carlo (не появятся даже с epsilon вероятностью).
+
+### 3. Векторизованная Fitness Evaluation
+
+**Критическая оптимизация:** Оценка fitness — самая частая операция (50K+ вызовов).
+
+**Pre-stacking scenarios:**
+```python
+# ВМЕСТО: цикл по scenarios в каждом evaluate_fitness call
+for scenario in scenarios:
+    cost = (scenario * matrix).sum()
+    
+# ИСПОЛЬЗУЕМ: векторизация через broadcasting
+S_stack = np.stack(scenarios)  # Shape: [K scenarios, I bins, J ratings]
+costs = (S_stack * matrix).sum(axis=(1, 2))  # Shape: [K]
+```
+
+**Асимметричная budget tolerance:**
+```python
+# Классический подход: symmetric ±5%
+within_budget = (np.abs(deviations) <= tolerance).sum()
+
+# Новый подход: asymmetric -5% to +1.5%
+within_budget = (
+    (deviations >= -BUDGET_TOLERANCE_LOWER) & 
+    (deviations <= BUDGET_TOLERANCE_UPPER)
+).sum()
+```
+
+**Обоснование:** Underspend (-5%) менее критичен для бизнеса, чем overspend (+1.5%).
+
+**Band-aware penalty:**
+```python
+def _band_penalty(deviation, lower, upper):
+    if deviation < -lower:
+        return (-deviation - lower) / lower  # Scaled underspend penalty
+    if deviation > upper:
+        return (deviation - upper) / upper   # Scaled overspend penalty
+    return 0.0  # Inside band → zero penalty
+```
+
+### 4. Differentiation Score
+
+**Мотивация:** Матрицы с минимальными шагами удовлетворяют constraints, но не дают видимой дифференциации.
+
+**Robust slope measurement:**
+```python
+def differentiation_score(matrix):
+    for i in range(num_cr_bins):
+        steps = []
+        for j in range(num_ratings - 1):
+            if not (STRICT_ZERO_MASK[i, j] or STRICT_ZERO_MASK[i, j+1]):
+                steps.append(max(matrix[i, j+1] - matrix[i, j], 0.0))
+        
+        mean_step = np.mean(steps)
+        
+        # Target: 15% выше minimum, Cap: 50% от maximum
+        target = CONSTRAINTS['min_step_rating'] * 1.15
+        cap = CONSTRAINTS['step_max_rating'] * 0.5
+        
+        score = min(mean_step, cap) / target  # Normalized 0..1
+```
+
+**Row weighting:** Нижние CR bins (core population) получают больший вес:
+```python
+weights = np.linspace(1.0, 0.6, num_cr_bins)  # Row 0: 1.0, Last row: 0.6
+final_score = np.average(per_row_scores, weights=weights)
+```
+
+**Integration в fitness:**
+```python
+total_fitness = (
+    0.70 * budget_score +      # Primary: budget accuracy
+    0.30 * constraint_score +  # Secondary: constraint satisfaction
+    DIFF_WEIGHT * diff_score   # Bonus: visible differentiation
+)
+```
+
+**Типичный DIFF_WEIGHT:** 0.10-0.30 (достаточно для "nudge", не доминирует над budget).
+
+### 5. Генетический Алгоритм — Architecture
+
+**Population initialization: Structured seeding**
+```python
+# 70% structured matrices (monotonic, step-aware)
+matrix = create_structured_matrix()  
+
+# 30% with aggressive zeros (if cell_min = 0)
+matrix = create_structured_matrix_with_zeros()
+```
+
+**Selection: Tournament**
+```python
+# Выбор k=5 случайных, возврат best
+def tournament_selection(population, k=5):
+    tournament = random.sample(population, k)
+    return max(tournament, key=lambda x: x.fitness)
+```
+
+**Crossover: Blend with smoothing**
+```python
+def crossover(parent1, parent2):
+    alpha = uniform(0.3, 0.7)  # Controlled blend
+    child = alpha * parent1 + (1 - alpha) * parent2
+    child = gaussian_filter(child, sigma=0.5)  # Smooth noise
+    return child
+```
+
+**Mutation: Structure-aware perturbation**
+```python
+def mutate(matrix, rate=0.25):
+    for i, j in matrix.indices:
+        if random() < rate:
+            delta = normal(0, cell_max * 0.05)  # 5% of max
+            matrix[i, j] += delta
+    return repair_matrix(matrix)  # Fix monotonicity
+```
+
+**Elitism:** Top 10% (100/1000) переходят без изменений → сохранение best solutions.
+
+**Early stopping:**
+```python
+if improvement < 1e-5 for 50 generations:
+    break  # Converged
+```
+
+### 6. Matrix Repair — Monotonicity Enforcement
+
+**Проблема:** После мутации/кроссовера матрица может нарушить монотонность.
+
+**Rating monotonicity (horizontal):**
+```python
+for i in range(num_cr_bins):
+    for j in range(1, num_ratings):
+        if matrix[i, j] < matrix[i, j-1]:
+            # Force: rating j >= rating j-1
+            matrix[i, j] = matrix[i, j-1] + min_step_rating * 0.5
+```
+
+**CR monotonicity (vertical):**
+```python
+for i in range(1, num_cr_bins):
+    for j in range(num_ratings):
+        if matrix[i, j] > matrix[i-1, j]:
+            # Force: CR bin i <= CR bin i-1
+            matrix[i, j] = max(cell_min, matrix[i-1, j] - min_step_cr * 0.5)
+```
+
+**Skip forced zeros:** Monotonicity checks игнорируют strict zero cells.
+
+### 7. Anchor Cells & Strict Zeros
+
+**Anchor cells: Exact pinning**
+```python
+anchors = {
+    'max': (0, num_ratings-1, ANCHOR_CELL_MAX),  # Best performers
+    'min': (num_cr_bins-1, 0, ANCHOR_CELL_MIN)   # Worst performers
+}
+
+# Applied at every modification
+matrix[i_max, j_max] = ANCHOR_CELL_MAX
+matrix[i_min, j_min] = ANCHOR_CELL_MIN
+```
+
+**Strict zeros: Multiple cells**
+```python
+FORCE_ZERO_CELLS = {
+    4: [0, 1],  # CR bin 4, ratings 1-2 → 0%
+    3: [0]      # CR bin 3, rating 1 → 0%
+}
+
+# Massive penalty for violations
+if STRICT_ZERO_MASK[i, j] and abs(matrix[i, j]) > eps:
+    penalties.append(abs(matrix[i, j]) * 1000)
+```
+
+### 8. Local Refinement (Top 5 Only)
+
+**После GA: L-BFGS-B optimization для топ-5 кандидатов**
+```python
+def local_refinement(matrix, S_stack, merit_pool):
+    def objective(x):
+        mat = x.reshape(num_cr_bins, num_ratings)
+        mat = repair_matrix(mat)
+        fitness, _, _, _, _ = evaluate_fitness(mat, S_stack, merit_pool)
+        return -fitness  # Minimize negative fitness
+    
+    bounds = [(cell_min, cell_max)] * matrix.size
+    
+    # Override bounds for fixed cells
+    for i, j in anchor_positions:
+        bounds[idx] = (exact_value, exact_value)
+    for i, j in strict_zero_positions:
+        bounds[idx] = (0.0, 0.0)
+    
+    result = minimize(objective, matrix.flatten(), 
+                     method='L-BFGS-B', bounds=bounds, 
+                     options={'maxiter': 100})
+```
+
+**Rationale:** GA находит basin of attraction, L-BFGS-B fine-tunes до локального оптимума.
+
+### 9. Stress Testing & Policy Guidance
+
+**Stress scenarios: 5 типов распределений**
+```python
+scenarios = {
+    'target': TARGET_RATING_DISTRIBUTION,  # Baseline
+    'inflated': skew_toward_high_ratings,  # Grade inflation
+    'harsh': skew_toward_low_ratings,      # Strict managers
+    'forced_curve': bell_curve,            # Forced ranking
+    'top_heavy': 70% in upper half         # Leniency
+}
+```
+
+**Policy generation: Percentile-based ranges**
+```python
+# Run 200 successful scenarios
+for _ in range(200):
+    if budget_within_tolerance:
+        successful_dists.append(rating_distribution)
+
+# For each rating: P10-P90 range
+PolicyGuidance(
+    rating=rating,
+    target_pct=TARGET[rating],
+    hard_min_pct=np.percentile(successful_dists[rating], 10),
+    hard_max_pct=np.percentile(successful_dists[rating], 90)
+)
+```
+
+**Output:** "Для 80% success rate держите рейтинг 5 в диапазоне 8-12% (target 10%)".
+
+### 10. Deduplication & Export
+
+**Problem:** Crossover может создавать дубликаты.
+
+**Solution: Matrix-level deduplication**
+```python
+def deduplicate_candidates(candidates, tolerance=1e-6):
+    unique = []
+    for candidate in candidates:
+        if not any(np.allclose(candidate.matrix, seen, atol=tolerance) 
+                   for seen in unique):
+            unique.append(candidate)
+    return unique
+```
+
+**Excel export: Multi-sheet workbook**
+```
+Rank_01:
+  - Metadata (fitness, success rate, budget score, constraint score, diff score)
+  - Merit Matrix (% format, CR bins × Ratings)
+  - Policy Guidance (target/min/max % для каждого рейтинга)
+  
+Rank_02:
+  ...
+  
+Rank_20:
+  ...
+```
+
+## Воспроизводимость
+
+**Input:** 
+* `Company_Data.xlsx` (employee data: base_salary, CR) или synthetic data (n=1200, lognormal salaries)
+* Configuration: merit pool, tolerances, constraints, anchor cells
+
+**Output:**
+* `artifacts/merit_matrices_all_scenarios.xlsx` — 20 sheets с топ-20 матрицами
+* `artifacts/candidate_summary.csv` — ранжирование по fitness
+* `artifacts/optimization_config.json` — полная конфигурация запуска
+
+**Seeds для воспроизводимости:**
+* `SEED_BASE_POPULATION = 42` — synthetic employee data
+* `SEED_SCENARIOS = 2025` — Monte Carlo scenario generation
+* `SEED_GA = 89` — genetic algorithm initialization
+
+**Время выполнения:**
+* Population initialization (1000 matrices): ~5-10 секунд
+* GA evolution (500 generations, 1000 pop): ~15-30 минут
+  * Каждое поколение: 1000 fitness evaluations × 2K scenarios
+  * С quick_eval_scenarios=2000, full_eval_scenarios=10000
+* Local refinement (top 5): ~2-5 минут
+* Полный запуск: **~20-40 минут** на стандартном laptop (8 cores, 16GB RAM)
+
+**Scaling considerations:**
+```python
+if len(employees) > 5000 and total_evals > 60_000:
+    print("Large run detected. Consider reducing:")
+    print("  - population_size (1000 → 500)")
+    print("  - num_generations (500 → 250)")
+```
+
+---
+
+**Технический результат:** Генетический алгоритм с адаптивными constraints, асимметричной budget tolerance и дифференциацией находит merit matrices, которые:
+1. **Попадают в бюджет** в 70-95% Monte Carlo сценариев (vs ~40-50% у наивных подходов)
+2. **Обеспечивают видимую дифференциацию** через differentiation score
+3. **Удовлетворяют HR constraints** (monotonicity, step sizes, anchor cells)
+4. **Устойчивы к вариациям** распределения рейтингов (stress tests)
+
+**Практическое применение:** Компании с merit pool 8-13% и группами 100-1000 сотрудников получают matrices, которые балансируют budget discipline и performance differentiation без ручной итерации.
+
 ---
 
 ## Общие выводы
