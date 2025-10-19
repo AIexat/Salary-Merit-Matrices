@@ -308,6 +308,183 @@ def _run_simulations_weighted(...):
 
 **НЕ применимо для:** 75-80% организаций (малый, средний бизнес и большинство компаний до 1,000 человек)
 
+
+# Технические решения (Часть 2: Statistical Analysis & Validation)
+
+## Используемые библиотеки
+
+**Научные вычисления:**
+* `pandas` — обработка табличных результатов Monte Carlo (350K+ групп)
+* `numpy` — численные операции, векторизация расчетов
+
+**Визуализация:**
+* `matplotlib` — базовые графики, multi-panel dashboards
+* `seaborn` — продвинутые визуализации (heatmaps, correlation matrices)
+
+**Статистика и оптимизация:**
+* `scipy.optimize.minimize` — оптимизация для piecewise regression
+  * Метод: L-BFGS-B с bounded constraints
+  * Цель: минимизация MSE при поиске breakpoints
+* `scipy.stats` — корреляционный анализ (Pearson r), kernel density estimation
+* `sklearn.metrics` — метрики качества регрессии (MSE для model selection)
+
+## Ключевые технические решения
+
+### 1. Univariate Analysis (Sections 1-6)
+
+**Categorical encoding для корреляций:**
+```python
+# Ordinal encoding для сохранения порядка
+size_bin_encoding = {'0-20': 1, '21-50': 2, ..., '500+': 6}
+distribution_encoding = {'skewed_low': 1, 'uniform': 2, 'normal': 3, 'skewed_high': 4}
+```
+
+**Обоснование:** Pearson correlation требует числовые значения; ordinal encoding сохраняет смысловой порядок категорий.
+
+**Adaptive binning стратегия:**
+```python
+# Для group size: неравномерные bins для захвата критических переходов
+size_bins = [0, 20, 50, 100, 200, 500, np.inf]
+
+# Для budget: равномерные bins для business relevance
+budget_bins = [0, 5, 8, 10, 12, 15, np.inf]
+```
+
+### 2. Correlation Analysis (Section 7)
+
+**Multi-dimensional correlation matrix:**
+* Кодирование всех параметров как ordinal
+* Расчет p-values для статистической значимости
+* Интерпретация силы связи: |r| > 0.7 (Very Strong), > 0.4 (Strong), > 0.2 (Moderate)
+
+**Ключевое открытие:** Group size объясняет 66.22 п.п. вариации (r=0.861), все остальные факторы — только 36 п.п.
+
+### 3. Threshold Detection (Sections 8-9)
+
+**Systematic ladder testing:**
+```python
+thresholds = [20, 30, 40, 50, 75, 100, 125, 150, 175, 200, 250, 300, 400, 500, 750, 1000]
+
+for threshold in thresholds:
+    below = df[df['n_employees'] < threshold]
+    above = df[df['n_employees'] >= threshold]
+    success_boost = above['success_rate'].mean() - below['success_rate'].mean()
+```
+
+**Метрики:**
+* Success Boost — разница в mean success rate выше/ниже порога
+* Identifies "jumps" — пороги с максимальным приростом точности
+
+### 4. Sophisticated Methods (Section 10)
+
+**Piecewise Linear Regression:**
+
+Оптимизация breakpoints с constraints:
+```python
+def fit_piecewise_linear(x, y, n_segments, min_segment_size=1000):
+    # Constraint: минимум 1000 групп в каждом сегменте
+    # Objective: minimize MSE
+    # Method: L-BFGS-B optimization
+```
+
+**Numerical stability:**
+* Нормализация x перед fitting: `x_norm = (x - mean) / std`
+* Пересчет slopes/intercepts в исходный масштаб
+* Обработка edge cases (сегменты с 1 наблюдением)
+
+**Model Selection via AICc:**
+```python
+# Corrected Akaike Information Criterion для finite samples
+AIC = n * log(MSE) + 2*k
+AICc = AIC + (2*k*(k+1)) / (n - k - 1)
+```
+
+**Балансирует:**
+* Goodness of fit (минимизация MSE)
+* Model complexity (penalty за количество параметров)
+* **Результат:** Оптимальное число сегментов = arg min(AICc)
+
+**Monotonicity check:**
+```python
+is_monotone = np.all(np.diff(y_pred) >= -1e-6)  # Success rate не должен падать
+```
+
+### 5. Local Analysis at Breakpoints
+
+**Gaussian-weighted local mean:**
+```python
+# Adaptive window size: 1% данных или 30-200 групп
+window_size = max(30, min(200, int(len(x) * 0.01)))
+
+# Gaussian weights для smooth локального усреднения
+weights = np.exp(-((x_local - x0)**2) / (2 * sigma**2))
+local_mean = np.sum(weights * y_local)
+```
+
+**Bootstrap confidence intervals:**
+* 1000 resamples для оценки 95% CI
+* Weighted bootstrap с Gaussian weights
+* Результат: понимание uncertainty в критических точках
+
+### 6. Robust Threshold Detection — 4 метода
+
+**Cross-validation подход:**
+1. **Raw First-Hit** — первая группа ≥80%
+2. **Smoothed First-Hit** — rolling mean (window=100) ≥80%
+3. **Quantile-Based** — где P50/P60/P70 ≥80%
+4. **Piecewise Model Crossing** — где fitted model пересекает 80%
+
+**Consensus decision:** Если все методы дают похожие результаты → высокая уверенность в пороге.
+
+### 7. Advanced Visualizations
+
+**4-panel comprehensive view:**
+```python
+fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+
+# Panel 1: Detail view (0-2500) — фокус на критическом диапазоне
+# Panel 2: Log scale — весь range данных
+# Panel 3: Heatmap — 2D распределение (Size × Success Rate)
+# Panel 4: Bar chart — success by segment с color coding
+```
+
+**Design principles:**
+* Limited y-axis (0-105%) для удаления outliers
+* Color coding: Red (<60%), Orange (60-80%), Green (≥80%)
+* Breakpoint annotations с вертикальными линиями
+* Median values внутри bars для robustness check
+
+**Heatmap innovation:**
+* Нормализация по столбцам → % within each segment
+* Adaptive segment ranges на основе breakpoints
+* Text annotations только для values >2% (избежание clutter)
+* Adaptive text color: white на темном фоне, black на светлом
+
+## Воспроизводимость
+
+**Input:** `ALL_results.parquet` (результаты Monte Carlo из Части 1)
+
+**Output:**
+* Консольный вывод: summary statistics, correlation tables, threshold analysis
+* Визуализации: `threshold_analysis.png` (300 DPI, high-resolution)
+* Структурированные DataFrame для дальнейшего использования
+
+**Время выполнения:**
+* Loading data: 1-2 секунды (Parquet эффективен)
+* Univariate analysis: ~5 секунд
+* Piecewise regression (2-7 segments testing): ~30-60 секунд
+  * Optimization computationally intensive для >350K observations
+* Полный анализ: ~2-3 минуты на стандартном laptop
+
+**Критические parameters:**
+* `min_segment_size=1000` — статистическая значимость каждого сегмента
+* `n_bootstrap=1000` — баланс точности CI и времени выполнения
+* `window_pct=0.01` — локальное сглаживание (1% данных)
+
+---
+
+**Технический результат:** Математически строгая валидация метода с идентификацией точных пороговых значений (141-200 employees для перехода в зону надёжности) и количественной оценкой неопределённости для business decision making.
+
 ---
 
 ## Часть 3: Генетический алгоритм - решение проблемы
