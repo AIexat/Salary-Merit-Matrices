@@ -1,4 +1,4 @@
-# Бюджетирование повышений зарплат: Валидация метода, Анализ ограничений и Оптимизаци (Merit Matrix Budgeting: Validation, Analysis, and Optimization)
+# Бюджетирование повышений зарплат: Валидация метода, Анализ ограничений и Оптимизация (Merit Matrix Budgeting: Validation, Analysis, and Optimization)
 
 ## Автор
 Алексей Иванов  
